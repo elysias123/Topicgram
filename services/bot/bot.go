@@ -649,35 +649,36 @@ func (bot *Bot) handleUserNewMessage(update *botapi.Update) {
 		return
 	}
 
-	result, err := bot.Send(botapi.CopyMessageConfig{
+	// 使用 ForwardConfig 保留来源标记；失败时回退到 CopyMessage
+	result, err := bot.Send(botapi.ForwardConfig{
 		BaseChat:  botTopic,
 		FromChat:  currentChatConfig,
 		MessageID: msg.MessageID,
 	})
 	if err != nil {
-		if err, ok := err.(*botapi.Error); ok {
-			bot.Send(botapi.MessageConfig{
-				BaseChat: currentChat,
-				Text:     err.Message,
+		if apiErr, ok := err.(*botapi.Error); ok {
+			// 某些情况下 Forward 不被允许，尝试回退 CopyMessage 以保证功能不中断
+			copyResult, copyErr := bot.Send(botapi.CopyMessageConfig{
+				BaseChat:  botTopic,
+				FromChat:  currentChatConfig,
+				MessageID: msg.MessageID,
 			})
+			if copyErr != nil {
+				bot.Send(botapi.MessageConfig{BaseChat: currentChat, Text: apiErr.Message})
+				clog.Errorf("[Bot] failed to forward and copy message to group, forwardErr: %s, copyErr: %s", err, copyErr)
+				return
+			}
+			DB().Create(&model.Msg{TopicId: topic.Id, UserMsgId: msg.MessageID, TopicMsgId: copyResult.MessageID})
 			return
 		}
 
 		text, entities := translator.Error()
-		bot.Send(botapi.MessageConfig{
-			BaseChat: currentChat,
-			Text:     text,
-			Entities: entities,
-		})
-		clog.Errorf("[Bot] failed to copy message to group, error: %s", err)
+		bot.Send(botapi.MessageConfig{BaseChat: currentChat, Text: text, Entities: entities})
+		clog.Errorf("[Bot] failed to forward message to group, error: %s", err)
 		return
 	}
 
-	DB().Create(&model.Msg{
-		TopicId:    topic.Id,
-		UserMsgId:  msg.MessageID,
-		TopicMsgId: result.MessageID,
-	})
+	DB().Create(&model.Msg{TopicId: topic.Id, UserMsgId: msg.MessageID, TopicMsgId: result.MessageID})
 }
 
 func generateEditMessage(msg *botapi.Message, baseEdit botapi.BaseEdit) botapi.Chattable {
@@ -1982,58 +1983,50 @@ func (bot *Bot) handleTopicNewMessage(update *botapi.Update) {
 		return
 	}
 
-	result, err := bot.Send(botapi.CopyMessageConfig{
+	// 使用 ForwardConfig 保留来源标记；若失败回退到 CopyMessage
+	result, err := bot.Send(botapi.ForwardConfig{
 		BaseChat:  userChat,
 		FromChat:  currentChatConfig,
 		MessageID: msg.MessageID,
 	})
 	if err != nil {
-		if err, ok := err.(*botapi.Error); ok {
-			if strings.Contains(err.Message, "bot was blocked by the user") {
-				bot.Request(botapi.DeleteForumTopicConfig{
-					BaseForum: currentForum,
-				})
+		if apiErr, ok := err.(*botapi.Error); ok {
+			if strings.Contains(apiErr.Message, "bot was blocked by the user") {
+				bot.Request(botapi.DeleteForumTopicConfig{BaseForum: currentForum})
 				topic.TopicId = 0
-
 				if topic.IsBan {
 					DB().Save(&topic)
 				} else {
 					DB().Delete(&topic)
 				}
-
 				DB().Model(model.Msg{}).Where("topic_id", topic.Id).Delete(nil)
-
 				text, entities := translator.Blocked(topic.UserId)
-				bot.Send(botapi.MessageConfig{
-					BaseChat: currentGroup,
-					Text:     text,
-					Entities: entities,
-				})
+				bot.Send(botapi.MessageConfig{BaseChat: currentGroup, Text: text, Entities: entities})
 				return
 			}
 
-			bot.Send(botapi.MessageConfig{
-				BaseChat: currentChat,
-				Text:     err.Message,
+			// 回退 CopyMessage
+			copyResult, copyErr := bot.Send(botapi.CopyMessageConfig{
+				BaseChat:  userChat,
+				FromChat:  currentChatConfig,
+				MessageID: msg.MessageID,
 			})
+			if copyErr != nil {
+				bot.Send(botapi.MessageConfig{BaseChat: currentChat, Text: apiErr.Message})
+				clog.Errorf("[Bot] failed to forward and copy message to user, forwardErr: %s, copyErr: %s", err, copyErr)
+				return
+			}
+			DB().Create(&model.Msg{TopicId: topic.Id, UserMsgId: copyResult.MessageID, TopicMsgId: msg.MessageID})
 			return
 		}
 
 		text, entities := translator.Error()
-		bot.Send(botapi.MessageConfig{
-			BaseChat: currentChat,
-			Text:     text,
-			Entities: entities,
-		})
-		clog.Errorf("[Bot] failed to send message in group, error: %s", err)
+		bot.Send(botapi.MessageConfig{BaseChat: currentChat, Text: text, Entities: entities})
+		clog.Errorf("[Bot] failed to forward message to user, error: %s", err)
 		return
 	}
 
-	DB().Create(&model.Msg{
-		TopicId:    topic.Id,
-		UserMsgId:  result.MessageID,
-		TopicMsgId: msg.MessageID,
-	})
+	DB().Create(&model.Msg{TopicId: topic.Id, UserMsgId: result.MessageID, TopicMsgId: msg.MessageID})
 }
 
 func (bot *Bot) handleTopicEditMessage(update *botapi.Update) {
