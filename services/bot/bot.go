@@ -34,7 +34,7 @@ func Init(botConfig *model.BotConfig) error {
 		URL: &url.URL{
 			Scheme: "https",
 			Host:   botConfig.WebHook.Host,
-			Path:   "/topicgram/webhook",
+			Path:   botConfig.WebHook.Path,
 		},
 		MaxConnections: 100,
 		SecretToken:    secretToken,
@@ -134,6 +134,10 @@ func HookHandler(c *gin.Context) {
 
 	go bot.handleUpdate(update)
 	c.String(200, "OK")
+}
+
+func WebHookPath() string {
+	return bot.BotConfig.WebHook.Path
 }
 
 type Bot struct {

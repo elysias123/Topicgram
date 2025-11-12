@@ -7,5 +7,6 @@ type BotConfig struct {
 
 	WebHook struct {
 		Host string
+		Path string
 	}
 }

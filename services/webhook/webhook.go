@@ -16,6 +16,7 @@ func NewEngine() (router *gin.Engine) {
 
 	router.Use(gin.Recovery())
 
-	router.POST("/topicgram/webhook", bot.HookHandler)
+	// 使用 bot 包提供的路径获取函数，确保路径已规范化并可自定义
+	router.POST(string(bot.WebHookPath()), bot.HookHandler)
 	return
 }

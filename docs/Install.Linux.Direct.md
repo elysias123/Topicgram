@@ -37,7 +37,8 @@ bash <(curl -sSL "https://gitlab.com/CoiaPrant/Topicgram/-/raw/master/scripts/in
     "GroupId": 0,
     "LanguageCode": "zh-hans",
     "WebHook": {
-      "Host": "你的 WebHook 域名 (非 443 要带端口)"
+      "Host": "你的 WebHook 域名 (非 443 要带端口)",
+      "Path": "/topicgram/webhook"
     }
   },
   "Security": {
