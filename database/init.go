@@ -21,7 +21,7 @@ func InitDB(config config.Database) error {
 		return err
 	}
 
-	err = db.AutoMigrate(model.Topic{}, model.Msg{})
+	err = db.AutoMigrate(model.Topic{}, model.Msg{}, model.Setting{})
 	if err != nil {
 		return err
 	}

@@ -11,6 +11,9 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
+
+	"gorm.io/gorm"
 
 	botapi "github.com/OvyFlash/telegram-bot-api"
 	"github.com/gin-gonic/gin"
@@ -21,6 +24,8 @@ var (
 	bot         *Bot
 	secretToken string
 )
+
+const verifyModeSettingKey = "verify_mode"
 
 func Init(botConfig *model.BotConfig) error {
 	secretToken = utils.MD5(botConfig.WebHook.Host) + utils.SHA256(botConfig.Token)
@@ -85,12 +90,15 @@ func Init(botConfig *model.BotConfig) error {
 			return
 		}
 
+		commands := []botapi.BotCommand{
+			{Command: "ban", Description: translator.CommandDescription_Ban()},
+			{Command: "unban", Description: translator.CommandDescription_Unban()},
+			{Command: "terminate", Description: translator.CommandDescription_Terminate()},
+			{Command: "verify", Description: translator.CommandDescription_Verify()},
+		}
+
 		b.Request(botapi.SetMyCommandsConfig{
-			Commands: []botapi.BotCommand{
-				{Command: "ban", Description: translator.CommandDescription_Ban()},
-				{Command: "unban", Description: translator.CommandDescription_Unban()},
-				{Command: "terminate", Description: translator.CommandDescription_Terminate()},
-			},
+			Commands: commands,
 			Scope: &botapi.BotCommandScope{
 				Type:   "chat",
 				ChatID: botConfig.GroupId,
@@ -131,6 +139,11 @@ func HookHandler(c *gin.Context) {
 type Bot struct {
 	*model.BotConfig
 	*BotAPI
+
+	captchaMu           sync.Mutex
+	captcha             map[int64]*CaptchaInfo // user_id -> captcha info
+	skipMu              sync.Mutex
+	skipVerifiedForward map[int64]bool // user_id -> true
 }
 
 func (bot *Bot) handleUpdate(update *botapi.Update) {
@@ -184,6 +197,45 @@ func (bot *Bot) handleUpdate(update *botapi.Update) {
 		case update.Message != nil:
 			bot.handleUserNewMessage(update)
 		}
+	}
+}
+
+func (bot *Bot) updateVerifyMode(mode string) error {
+
+	var s model.Setting
+	err := DB().Where("key", verifyModeSettingKey).First(&s).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			s = model.Setting{Key: verifyModeSettingKey, Value: mode}
+			if err := DB().Create(&s).Error; err != nil {
+				return err
+			}
+		} else {
+			return err
+		}
+	} else {
+		s.Value = mode
+		if err := DB().Save(&s).Error; err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (bot *Bot) getVerifyMode() string {
+	var s model.Setting
+	if err := DB().Where("key", verifyModeSettingKey).First(&s).Error; err == nil {
+		return s.Value
+	} else if errors.Is(err, gorm.ErrRecordNotFound) {
+		s = model.Setting{Key: verifyModeSettingKey, Value: "off"}
+		if cerr := DB().Create(&s).Error; cerr != nil {
+			clog.Errorf("[DB] failed to init verify_mode, error: %s", cerr)
+		}
+		return "off"
+	} else {
+		clog.Errorf("[DB] failed to get verify_mode, error: %s", err)
+		return "off"
 	}
 }
 
@@ -371,7 +423,6 @@ func (bot *Bot) handleUserNewMessage(update *botapi.Update) {
 				Text:     text,
 				Entities: entities,
 			})
-
 			if err != nil {
 				clog.Errorf("[Bot] failed to send message in chat, error: %s", err)
 				return
@@ -416,6 +467,15 @@ func (bot *Bot) handleUserNewMessage(update *botapi.Update) {
 	}
 	botTopic := botapi.BaseChat{
 		ChatConfig: botChatConfig,
+	}
+
+	if topic.Id == 0 {
+		vmode := bot.getVerifyMode()
+		if vmode == "calculate" {
+			if ok := bot.Userverify(msg, translator, currentChat); !ok {
+				return
+			}
+		}
 	}
 
 	switch {
@@ -486,6 +546,16 @@ func (bot *Bot) handleUserNewMessage(update *botapi.Update) {
 		}
 	default:
 		botTopic.MessageThreadID = topic.TopicId
+	}
+	bot.skipMu.Lock()
+	skip := false
+	if bot.skipVerifiedForward != nil && bot.skipVerifiedForward[msg.From.ID] {
+		skip = true
+		delete(bot.skipVerifiedForward, msg.From.ID)
+	}
+	bot.skipMu.Unlock()
+	if skip {
+		return
 	}
 
 	if msg.HasProtectedContent {
@@ -664,7 +734,10 @@ func (bot *Bot) handleUserNewMessage(update *botapi.Update) {
 				MessageID: msg.MessageID,
 			})
 			if copyErr != nil {
-				bot.Send(botapi.MessageConfig{BaseChat: currentChat, Text: apiErr.Message})
+				bot.Send(botapi.MessageConfig{
+					BaseChat: currentChat,
+					Text:     apiErr.Message,
+				})
 				clog.Errorf("[Bot] failed to forward and copy message to group, forwardErr: %s, copyErr: %s", err, copyErr)
 				return
 			}
@@ -673,7 +746,11 @@ func (bot *Bot) handleUserNewMessage(update *botapi.Update) {
 		}
 
 		text, entities := translator.Error()
-		bot.Send(botapi.MessageConfig{BaseChat: currentChat, Text: text, Entities: entities})
+		bot.Send(botapi.MessageConfig{
+			BaseChat: currentChat,
+			Text:     text,
+			Entities: entities,
+		})
 		clog.Errorf("[Bot] failed to forward message to group, error: %s", err)
 		return
 	}
@@ -1255,6 +1332,38 @@ func (bot *Bot) handleTopicNewMessage(update *botapi.Update) {
 
 		command, args, _ := strings.Cut(msg.Text, " ")
 		switch command {
+
+		case "/verify", "/verify@" + bot.Self.UserName:
+			arg := strings.ToLower(strings.TrimSpace(args))
+			switch arg {
+			case "calculate", "off":
+				if err := bot.updateVerifyMode(arg); err != nil {
+					clog.Errorf("[DB] failed to update verify_mode, error: %s", err)
+					text, entities := translator.Error_Database()
+					bot.Send(botapi.MessageConfig{
+						BaseChat: currentChat,
+						Text:     text,
+						Entities: entities,
+					})
+					return
+				} else {
+					text, entities := translator.VerifyModeUpdated(arg)
+					bot.Send(botapi.MessageConfig{
+						BaseChat: currentChat,
+						Text:     text,
+						Entities: entities,
+					})
+					return
+				}
+			default:
+				text, entities := translator.CommandUsage_Verify()
+				bot.Send(botapi.MessageConfig{
+					BaseChat: currentChat,
+					Text:     text,
+					Entities: entities,
+				})
+			}
+
 		case "/ban", "/ban@" + bot.Self.UserName:
 			user_id, err := strconv.ParseInt(args, 10, 64)
 			if err != nil {
@@ -1590,6 +1699,7 @@ func (bot *Bot) handleTopicNewMessage(update *botapi.Update) {
 	if strings.HasPrefix(msg.Text, "/") {
 		command, _, _ := strings.Cut(msg.Text, " ")
 		switch command {
+
 		case "/ban", "/ban@" + bot.Self.UserName:
 			bot.Request(botapi.DeleteForumTopicConfig{
 				BaseForum: currentForum,
@@ -2001,7 +2111,11 @@ func (bot *Bot) handleTopicNewMessage(update *botapi.Update) {
 				}
 				DB().Model(model.Msg{}).Where("topic_id", topic.Id).Delete(nil)
 				text, entities := translator.Blocked(topic.UserId)
-				bot.Send(botapi.MessageConfig{BaseChat: currentGroup, Text: text, Entities: entities})
+				bot.Send(botapi.MessageConfig{
+					BaseChat: currentGroup,
+					Text:     text,
+					Entities: entities,
+				})
 				return
 			}
 
@@ -2012,7 +2126,10 @@ func (bot *Bot) handleTopicNewMessage(update *botapi.Update) {
 				MessageID: msg.MessageID,
 			})
 			if copyErr != nil {
-				bot.Send(botapi.MessageConfig{BaseChat: currentChat, Text: apiErr.Message})
+				bot.Send(botapi.MessageConfig{
+					BaseChat: currentChat,
+					Text:     apiErr.Message,
+				})
 				clog.Errorf("[Bot] failed to forward and copy message to user, forwardErr: %s, copyErr: %s", err, copyErr)
 				return
 			}
@@ -2021,7 +2138,11 @@ func (bot *Bot) handleTopicNewMessage(update *botapi.Update) {
 		}
 
 		text, entities := translator.Error()
-		bot.Send(botapi.MessageConfig{BaseChat: currentChat, Text: text, Entities: entities})
+		bot.Send(botapi.MessageConfig{
+			BaseChat: currentChat,
+			Text:     text,
+			Entities: entities,
+		})
 		clog.Errorf("[Bot] failed to forward message to user, error: %s", err)
 		return
 	}

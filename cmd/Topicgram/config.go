@@ -23,6 +23,8 @@ type Config struct {
 
 	Bot *model.BotConfig
 
+	// 兼容旧配置：不再使用 verify_enabled，改为通过 /verify 命令控制
+
 	Security struct {
 		InsecureSkipVerify bool
 	}
